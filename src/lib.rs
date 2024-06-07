@@ -54,8 +54,12 @@ use std::marker::PhantomData;
 use std::{collections::HashMap, str::FromStr};
 
 use chrono::{offset::FixedOffset, DateTime};
-use serde::de::{self, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+#[cfg(feature = "regex")]
+use regex::Regex;
+#[cfg(feature = "regex")]
+use serde::de::Unexpected;
+use serde::de::{self, Error, MapAccess, Visitor};
+use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
 use void::Void;
 
@@ -114,7 +118,6 @@ pub struct HttpInteraction {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Response {
     /// An HTTP Body.
-    #[serde(deserialize_with = "string_or_struct")]
     pub body: Body,
     /// The version of the HTTP Response.
     pub http_version: Option<Version>,
@@ -125,12 +128,246 @@ pub struct Response {
 }
 
 /// A recorded HTTP Body.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Body {
-    /// The encoding of the HTTP body.
-    pub encoding: Option<String>,
-    /// The HTTP body encoded as a string.
-    pub string: String,
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum Body {
+    /// A bare string, eg `"body": "ohai!"`
+    ///
+    /// Only matches if the request's body matches the specified string *exactly*.
+    String(String),
+    /// A string and the request's encoding.  Both must be exactly equal in order for the request
+    /// to match this interaction.
+    EncodedString {
+        /// The manner in which the string was encoded, such as `base64`
+        encoding: Option<String>,
+        /// The encoded string
+        string: String,
+    },
+    /// A series of [`BodyMatcher`] instances.  All specified matchers must pass in order for the
+    /// request to be deemed to match this interaction.
+    #[cfg(feature = "matching")]
+    Matchers(Vec<BodyMatcher>),
+
+    /// A JSON body.  Mostly useful to make it easier to define a JSON response body without having
+    /// to escape a thousand quotes.  Does *not* modify the `Content-Type` response header; you
+    /// still have to do that yourself.
+    #[cfg(feature = "json")]
+    Json(serde_json::Value),
+}
+
+impl std::fmt::Display for Body {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            Self::String(s) => f.write_str(s),
+            Self::EncodedString { encoding, string } => if let Some(encoding) = encoding {
+                f.write_fmt(format_args!("({encoding}){string}"))
+            } else {
+                f.write_str(string)
+            },
+            #[cfg(feature = "matching")]
+            Self::Matchers(m) => f.debug_list().entries(m.iter()).finish(),
+            #[cfg(feature = "json")]
+            Self::Json(j) => f.write_str(&serde_json::to_string(j).expect("invalid JSON body")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Body {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BodyVisitor(PhantomData<fn() -> Body>);
+
+        impl<'de> Visitor<'de> for BodyVisitor {
+            type Value = Body;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("string or map")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Body, E> {
+                Ok(FromStr::from_str(value).unwrap())
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Body, M::Error> {
+                match map.next_key::<String>()?.as_deref() {
+                    Some("encoding") => {
+                        let encoding = map.next_value()?;
+                        match map.next_key::<String>()?.as_deref() {
+                            Some("string") => Ok(Body::EncodedString {
+                                encoding,
+                                string: map.next_value()?,
+                            }),
+                            Some(k) => Err(M::Error::unknown_field(k, &["string"])),
+                            None => Err(M::Error::missing_field("string")),
+                        }
+                    }
+                    Some("string") => {
+                        let string = map.next_value()?;
+                        match map.next_key::<String>()?.as_deref() {
+                            Some("encoding") => Ok(Body::EncodedString {
+                                string,
+                                encoding: map.next_value()?,
+                            }),
+                            Some(k) => Err(M::Error::unknown_field(k, &["encoding"])),
+                            None => Err(M::Error::missing_field("encoding")),
+                        }
+                    }
+                    #[cfg(feature = "matching")]
+                    Some("matches") => Ok(Body::Matchers(map.next_value()?)),
+                    #[cfg(feature = "json")]
+                    Some("json") => Ok(Body::Json(map.next_value()?)),
+                    Some(k) => Err(M::Error::unknown_field(
+                        k,
+                        &[
+                            "encoding",
+                            "string",
+                            #[cfg(feature = "matching")]
+                            "matches",
+                            #[cfg(feature = "json")]
+                            "json",
+                        ],
+                    )),
+                    None => {
+                        // OK this is starting to get silly
+                        #[cfg(all(feature = "matching", feature = "json"))]
+                        let fields = "matches, json, encoding, or string";
+                        #[cfg(all(feature = "matching", not(feature = "json")))]
+                        let fields = "matches, encoding, or string";
+                        #[cfg(all(not(feature = "matching"), feature = "json"))]
+                        let fields = "json, encoding, or string";
+                        // Yes, DeMorgan says there's a better way to do this, but it's visually
+                        // more similar to the previous versions, so it's more readable, IMO
+                        #[cfg(all(not(feature = "matching"), not(feature = "json")))]
+                        let fields = "encoding or string";
+
+                        Err(M::Error::missing_field(fields))
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_any(BodyVisitor(PhantomData))
+    }
+}
+
+impl Serialize for Body {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::String(s) => ser.serialize_str(s),
+            Self::EncodedString { encoding, string } => {
+                let mut map = ser.serialize_map(Some(2))?;
+                map.serialize_entry("string", string)?;
+                map.serialize_entry("encoding", encoding)?;
+                map.end()
+            }
+            #[cfg(feature = "matching")]
+            Self::Matchers(m) => {
+                let mut map = ser.serialize_map(Some(1))?;
+                map.serialize_entry("matches", m)?;
+                map.end()
+            }
+            #[cfg(feature = "json")]
+            Self::Json(j) => {
+                let mut map = ser.serialize_map(Some(1))?;
+                map.serialize_entry("json", j)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl PartialEq for Body {
+    fn eq(&self, other: &Body) -> bool {
+        match self {
+            Self::String(s) => match other {
+                Self::String(o) => s == o,
+                Self::EncodedString { encoding, string } => encoding.is_none() && s == string,
+                #[cfg(feature = "matching")]
+                Self::Matchers(_) => other.eq(self),
+                #[cfg(feature = "json")]
+                Self::Json(j) => serde_json::to_string(j).expect("invalid JSON body") == *s,
+            },
+            Self::EncodedString { encoding, string } => match other {
+                Self::String(s) => encoding.is_none() && s == string,
+                Self::EncodedString {
+                    encoding: oe,
+                    string: os,
+                } => encoding == oe && string == os,
+                #[cfg(feature = "matching")]
+                Self::Matchers(_) => false,
+                #[cfg(feature = "json")]
+                Self::Json(_) => false,
+            },
+            #[cfg(feature = "matching")]
+            Self::Matchers(matchers) => match other {
+                Self::String(s) => matchers.iter().all(|m| m.matches(s)),
+                Self::EncodedString { .. } => false,
+                #[cfg(feature = "matching")]
+                Self::Matchers(_) => false,
+                #[cfg(feature = "json")]
+                Self::Json(j) => {
+                    let s = serde_json::to_string(j).expect("invalid JSON body");
+                    matchers.iter().all(|m| m.matches(&s))
+                }
+            },
+            #[cfg(feature = "json")]
+            Self::Json(_) => other.eq(self),
+        }
+    }
+}
+
+/// A mechanism for determining if a request body matches a specified substring or regular
+/// expression.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum BodyMatcher {
+    /// The body must contain exactly the string specified.
+    #[serde(rename = "substring")]
+    Substring(String),
+    /// The body must match the specified regular expression.
+    #[cfg(feature = "regex")]
+    #[serde(
+        rename = "regex",
+        deserialize_with = "parse_regex",
+        serialize_with = "serialize_regex"
+    )]
+    Regex(Regex),
+}
+
+#[cfg(feature = "regex")]
+fn parse_regex<'de, D: Deserializer<'de>>(d: D) -> Result<Regex, D::Error> {
+    struct RegexVisitor(PhantomData<fn() -> Regex>);
+
+    impl<'de> Visitor<'de> for RegexVisitor {
+        type Value = Regex;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("valid regular expression as a string")
+        }
+
+        fn visit_str<E: de::Error>(self, s: &str) -> Result<Regex, E> {
+            Regex::new(s).map_err(|_| {
+                E::invalid_value(Unexpected::Other("invalid regular expression"), &self)
+            })
+        }
+    }
+
+    d.deserialize_str(RegexVisitor(PhantomData))
+}
+
+#[cfg(feature = "regex")]
+fn serialize_regex<S: Serializer>(r: &Regex, ser: S) -> Result<S::Ok, S::Error> {
+    ser.serialize_str(r.as_str())
+}
+
+#[cfg(feature = "matching")]
+impl BodyMatcher {
+    fn matches(&self, s: &str) -> bool {
+        match self {
+            Self::Substring(m) => s.contains(m),
+            #[cfg(feature = "regex")]
+            Self::Regex(r) => r.is_match(s),
+        }
+    }
 }
 
 impl FromStr for Body {
@@ -139,10 +376,7 @@ impl FromStr for Body {
     type Err = Void;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Body {
-            encoding: None,
-            string: s.to_string(),
-        })
+        Ok(Body::String(s.to_string()))
     }
 }
 
@@ -161,7 +395,6 @@ pub struct Request {
     /// The Request URI.
     pub uri: Url,
     /// The Request body.
-    #[serde(deserialize_with = "string_or_struct")]
     pub body: Body,
     /// The Request method.
     pub method: Method,
@@ -239,40 +472,4 @@ pub enum Version {
     /// HTTP/3.0
     #[serde(rename = "3")]
     Http3_0,
-}
-
-// Copied from: https://serde.rs/string-or-struct.html
-fn string_or_struct<'de, T, D>(deserializer: D) -> Result<T, D::Error>
-where
-    T: Deserialize<'de> + FromStr<Err = Void>,
-    D: Deserializer<'de>,
-{
-    struct StringOrStruct<T>(PhantomData<fn() -> T>);
-
-    impl<'de, T> Visitor<'de> for StringOrStruct<T>
-    where
-        T: Deserialize<'de> + FromStr<Err = Void>,
-    {
-        type Value = T;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("string or map")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<T, E>
-        where
-            E: de::Error,
-        {
-            Ok(FromStr::from_str(value).unwrap())
-        }
-
-        fn visit_map<M>(self, map: M) -> Result<T, M::Error>
-        where
-            M: MapAccess<'de>,
-        {
-            Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))
-        }
-    }
-
-    deserializer.deserialize_any(StringOrStruct(PhantomData))
 }

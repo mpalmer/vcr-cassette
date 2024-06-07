@@ -14,9 +14,14 @@ authors = [
 ]
 
 [features]
+json = ["dep:serde_json"]
+matching = []
+regex = ["dep:regex"]
 
 [dependencies]
+regex = { version = "1", optional = true }
 serde = { version = "1.0.127", features = ["derive"] }
+serde_json = { version = "1", optional = true }
 void = "1.0.2"
 chrono = "0.4.19"
 url = { version = "2.2.2", features = ["serde"] }

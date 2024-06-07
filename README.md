@@ -89,6 +89,44 @@ To deserialize `.yaml` Cassette files use
 $ cargo add vcr-cassette
 ```
 
+## Features
+
+* `json` -- enables parsing and comparison of JSON request and response bodies.
+  Saves having to escape every double quote character in your JSON-format bodies when you're manually
+  writing them.  Looks like this:
+
+  ```json
+  {
+    "body": {
+      "json": {
+        "arbitrary": ["json", "is", "now", "supported"],
+        "success_factor": 100,
+      }
+    }
+  }
+  ```
+
+* `matching` -- provides a mechanism for specifying "matchers" for request bodies, rather than a request body
+  having to be byte-for-byte compatible with what's specified in the cassette.  There are currently two match types available, `substring` and `regex` (if the `regex` feature is also enabled).
+  They do more-or-less what they say on the tin.  Use them like this:
+
+  ```json
+  {
+    "body": {
+      "matches": [
+        { "substring": "something" },
+        { "substring": "funny" },
+        { "regex": "\\d+" }
+      ]
+    }
+  }
+  ```
+
+  The above stanza, appropriately placed in a *request* specification, will match any request whose body contains the strings `"something"`, and `"funny"`, and *also* contains a number (of any length).
+
+* `regex` -- Enables the `regex` match type.
+  This is a separate feature, because the `regex` crate can be a bit heavyweight for resource-constrained environments, and so it's optional, in case you don't need it.
+
 ## Safety
 This crate uses ``#![deny(unsafe_code)]`` to ensure everything is implemented in
 100% Safe Rust.

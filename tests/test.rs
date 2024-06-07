@@ -25,7 +25,8 @@ fn smoke_yaml() {
     for name in names {
         let name = format!("tests/fixtures/{}", name);
         println!("testing: {}", name);
-        let example = fs::read_to_string(name).unwrap();
-        let _out: Cassette = serde_yaml::from_str(&example).unwrap();
+        let example = fs::read_to_string(&name).unwrap();
+        let _out: Cassette =
+            serde_yaml::from_str(&example).expect(&format!("failed to parse {name}"));
     }
 }
